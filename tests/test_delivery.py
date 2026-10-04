@@ -19,6 +19,8 @@ def client():
     conn = db.connect()
     conn.executescript(
         "DELETE FROM draft_rules;"
+        "DELETE FROM draft_revision_rules;"
+        "DELETE FROM draft_revisions;"
         "DELETE FROM delivery_policy;"
         "DELETE FROM delivery_decisions;"
         "DELETE FROM version_rules;"
@@ -27,6 +29,7 @@ def client():
         "UPDATE draft_meta SET revision = 0 WHERE id = 1;"
     )
     conn.close()
+    db.init_db()  # 重建当前修订（0）的空草稿快照
     with TestClient(app) as c:
         yield c
 

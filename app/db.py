@@ -1,9 +1,10 @@
-"""SQLite 存储层：草稿（带乐观锁修订号）与不可变发布版本。"""
+"""SQLite 存储层：草稿（带乐观锁修订号）、草稿修订快照与不可变发布版本。"""
 from __future__ import annotations
 
 import os
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 from . import config
 
@@ -20,6 +21,22 @@ CREATE TABLE IF NOT EXISTS draft_rules (
     action     TEXT NOT NULL CHECK (action IN ('reject', 'route')),
     targets    TEXT NOT NULL DEFAULT '[]',   -- JSON: [{"kind": "alias"|"mailbox", "value": "..."}]
     PRIMARY KEY (match_type, match_key)
+);
+
+-- 草稿修订快照：每次草稿变更（整体替换或按键合并）都留下一份完整规则快照，
+-- 供所见修订落后的增量合并做键级核对。快照不可变、永久保留。
+CREATE TABLE IF NOT EXISTS draft_revisions (
+    revision   INTEGER PRIMARY KEY,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS draft_revision_rules (
+    revision   INTEGER NOT NULL REFERENCES draft_revisions (revision),
+    match_type TEXT NOT NULL,
+    match_key  TEXT NOT NULL,
+    action     TEXT NOT NULL,
+    targets    TEXT NOT NULL,
+    PRIMARY KEY (revision, match_type, match_key)
 );
 
 CREATE TABLE IF NOT EXISTS versions (
@@ -81,8 +98,27 @@ def init_db() -> None:
     conn = connect()
     try:
         conn.executescript(SCHEMA)
+        _ensure_current_snapshot(conn)
     finally:
         conn.close()
+
+
+def _ensure_current_snapshot(conn: sqlite3.Connection) -> None:
+    """迁移兜底：当前草稿修订若无快照（旧库升级、清库重建），按当前规则补建一份。
+
+    快照内容即当前 draft_rules——该修订最后一次变更后的状态，正是键级核对所需的基准。
+    """
+    revision = conn.execute("SELECT revision FROM draft_meta WHERE id = 1").fetchone()["revision"]
+    exists = conn.execute("SELECT 1 FROM draft_revisions WHERE revision = ?", (revision,)).fetchone()
+    if exists is not None:
+        return
+    created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    conn.execute("INSERT INTO draft_revisions (revision, created_at) VALUES (?, ?)", (revision, created_at))
+    rows = conn.execute("SELECT match_type, match_key, action, targets FROM draft_rules").fetchall()
+    conn.executemany(
+        "INSERT INTO draft_revision_rules (revision, match_type, match_key, action, targets) VALUES (?, ?, ?, ?, ?)",
+        [(revision, r["match_type"], r["match_key"], r["action"], r["targets"]) for r in rows],
+    )
 
 
 @contextmanager

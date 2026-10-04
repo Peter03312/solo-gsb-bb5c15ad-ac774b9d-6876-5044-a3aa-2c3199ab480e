@@ -12,6 +12,11 @@
   任一分支**拒收 / 无路由 / 成环** → 整次解析失败（422），不返回部分结果。
 - **草稿编辑**：整体替换，必须携带所见修订号（乐观锁），冲突返回 409。
   无效地址、重复规则、空目标（`route` 无目标 / `reject` 带目标）在编辑期即拒绝（422）。
+- **草稿按键合并（多人协作）**：`PATCH /draft` 按规则键提交一组 `set` / `delete` 操作与所见修订号。
+  每次草稿变更（含整体替换）都留下可核对的修订快照；所见修订落后时，仅当本次涉及的每个键
+  相对该快照均未改变才把整组操作合并到当前草稿（新修订 +1），否则返回冲突键与当前修订号（409），
+  草稿不变；重复操作键、删除当前不存在的规则、无效规则整组拒绝（422），无法取得所见修订快照时
+  明确拒绝（409）。核对与写入在单个 `BEGIN IMMEDIATE` 事务内原子完成，合并后的草稿按原流程发布。
 - **发布**：在单个事务（`BEGIN IMMEDIATE`）内原子核对修订号，并校验**所有规则目标可解析且无环**；
   成功则生成不可变版本，失败则保持旧版本不变。
 - **历史版本**：所有发布版本永久可查，按任意历史版本解析可复现当时的结果。
@@ -73,6 +78,7 @@ pytest tests/ -q                                   # 运行测试
 | GET  | `/health`         | 健康检查                               |
 | GET  | `/draft`          | 查看草稿（含当前修订号）               |
 | PUT  | `/draft`          | 整体替换草稿，需携带所见修订号         |
+| PATCH | `/draft`         | 按键合并一组 set/delete 操作，需所见修订号 |
 | POST | `/publish`        | 核对修订号 + 全量校验后发布不可变版本  |
 | GET  | `/versions`       | 列出全部已发布版本                     |
 | GET  | `/versions/{n}`   | 查看某个历史版本的完整规则             |
@@ -114,7 +120,41 @@ curl -X PUT http://localhost:8000/draft -H 'Content-Type: application/json' -d '
 
 修订号过期时返回 `409`：`{"detail": {"error": "revision_conflict", "current_revision": 1, ...}}`。
 
-### 2. 发布（原子核对修订号 + 校验目标可解析、无环）
+### 2. 按键合并草稿（多人协作）
+
+多位维护者基于同一份草稿各自编辑时，不必整体替换：`PATCH /draft` 提交一组
+**按规则键的 `set` / `delete` 操作**与所见修订号，服务把整组操作原子合并到当前草稿。
+
+```bash
+curl -X PATCH http://localhost:8000/draft -H 'Content-Type: application/json' -d '{
+  "revision": 1,
+  "ops": [
+    {"op": "set", "match_type": "exact", "match_key": "carol@corp.example.com",
+     "action": "route", "targets": [{"kind": "mailbox", "value": "carol@mail.example.com"}]},
+    {"op": "delete", "match_type": "exact", "match_key": "blocked@corp.example.com"}
+  ]}'
+# => {"revision": 2, "rules": [...]}   （响应即合并后的完整草稿，形状同 PUT /draft）
+```
+
+- 规则键与 `set` 内容沿用与整体替换相同的规范化与校验（小写、去空白、地址/域合法、
+  `route` 至少一个目标、`reject` 不带目标）；`delete` 只需 `match_type` + `match_key`。
+- **每次草稿变更（含整体替换）都会留下该修订的完整快照**。所见修订即当前修订时直接合并；
+  落后时取出所见修订的快照，仅当本次操作涉及的**每个键**相对该快照均未改变
+  （内容相同、或同样不存在）才合并，产生一个新修订；任一键已被他人改动则整组拒绝：
+  `409 {"detail": {"error": "keys_conflict", "current_revision": 3,
+  "conflicting_keys": [{"match_type": "exact", "match_key": "carol@corp.example.com"}]}}`，
+  草稿不变。调用方可重新 `GET /draft` 后基于新修订重试。
+- 无法取得所见修订的快照（如修订号超出范围）时明确拒绝：
+  `409 {"detail": {"error": "snapshot_unavailable", "current_revision": 3, "seen_revision": 9}}`。
+- 以下情况**整组拒绝（422），草稿不变**：重复操作键（规范化后相同）、
+  删除当前不存在的规则（`delete_missing`，附 `missing_keys`）、无效规则或操作
+  （`invalid_ops`，如 `delete` 携带目标、`set` 缺 `action`、空操作组）。
+- 核对与写入在单个 `BEGIN IMMEDIATE` 事务内原子完成：并发提交各自基于同一修订的
+  操作时，不重叠的键都能合并成功，重叠的键恰有一个成功、其余收到 `keys_conflict`。
+- 合并产生的新修订与整体替换的修订号同一序列，合并后的草稿按原流程
+  `POST /publish` 发布；`PUT /draft`、`POST /resolve` 等既有接口约定不变。
+
+### 3. 发布（原子核对修订号 + 校验目标可解析、无环）
 
 ```bash
 curl -X POST http://localhost:8000/publish -H 'Content-Type: application/json' -d '{"revision": 1}'
@@ -127,7 +167,7 @@ curl -X POST http://localhost:8000/publish -H 'Content-Type: application/json' -
 {"detail": {"error": "validation_failed", "problems": [{"seed": "...", "error": "cycle", "chain": [...]}]}}
 ```
 
-### 3. 解析收件地址
+### 4. 解析收件地址
 
 ```bash
 curl -X POST http://localhost:8000/resolve -H 'Content-Type: application/json' \
@@ -165,7 +205,7 @@ curl -X POST http://localhost:8000/resolve -H 'Content-Type: application/json' \
 
 `error` 取值：`rejected`（命中拒收规则）、`no_route`（别名无路由）、`cycle`（成环）。
 
-### 4. 历史版本查询与复现
+### 5. 历史版本查询与复现
 
 ```bash
 curl http://localhost:8000/versions        # 全部版本
@@ -174,7 +214,7 @@ curl http://localhost:8000/versions/1      # 某版本的完整规则快照
 
 草稿后续修改、发布新版本后，仍可用 `"version": 1` 调 `/resolve` 复现当时的判定结果。
 
-### 5. 发布前预览：草稿 vs 基线版本
+### 6. 发布前预览：草稿 vs 基线版本
 
 管理员在发布前用 `POST /preview` 对比**当前草稿**与某个**已发布版本**的投递差异。
 请求携带基线版本号与所见草稿修订号：
@@ -232,7 +272,7 @@ curl -X POST http://localhost:8000/preview -H 'Content-Type: application/json' \
 
 管理员可以让某个**已发布候选版本**按流量比例可控地成为默认投递结果，基线版本承接其余流量。
 
-### 6. 配置策略（基线 / 候选 / 比例 / 策略修订号）
+### 7. 配置策略（基线 / 候选 / 比例 / 策略修订号）
 
 ```bash
 curl -X PUT http://localhost:8000/policy -H 'Content-Type: application/json' -d '{
@@ -259,7 +299,7 @@ curl -X PUT http://localhost:8000/policy -H 'Content-Type: application/json' -d 
 
 策略修订号与草稿修订号相互独立；改策略不会修改草稿、历史版本，也不会让任何已发布版本被改写。
 
-### 7. 默认投递：只给收件地址
+### 8. 默认投递：只给收件地址
 
 ```bash
 curl -X POST http://localhost:8000/deliver -H 'Content-Type: application/json' \
@@ -304,7 +344,7 @@ curl -X POST http://localhost:8000/deliver -H 'Content-Type: application/json' \
 # => 422 {"detail": {"error": "rejected", ..., "policy_revision": 2, "version": 2, "selection": "candidate"}}
 ```
 
-### 8. 显式版本解析保持兼容
+### 9. 显式版本解析保持兼容
 
 `POST /resolve` 的请求（必须带 `version`）、成功响应与错误约定（`404 version_not_found`、
 `422` 的 `rejected` / `no_route` / `cycle` / `invalid_address`）完全不变，不受任何策略影响；
@@ -316,7 +356,7 @@ curl -X POST http://localhost:8000/deliver -H 'Content-Type: application/json' \
 增加**调用方唯一投递编号**：首次受理时把完整判定持久化，之后相同编号的重试 / 并发请求
 原样返回首次判定，绝不因策略变更或重试时机不同而给出不同结果。
 
-### 9. 提交投递判定（投递编号 + 收件地址）
+### 10. 提交投递判定（投递编号 + 收件地址）
 
 ```bash
 curl -X POST http://localhost:8000/deliveries -H 'Content-Type: application/json' \
@@ -368,7 +408,7 @@ curl -X POST http://localhost:8000/deliveries -H 'Content-Type: application/json
 **编号不被无效请求占用**：无效地址（`422 invalid_address`）与未配置策略
 （`409 policy_not_configured`）都不会写入判定，修正后可用同一编号重新提交。
 
-### 10. 查询已持久化的判定
+### 11. 查询已持久化的判定
 
 ```bash
 curl http://localhost:8000/deliveries/msg-2026-10-04-0001
@@ -404,13 +444,13 @@ curl http://localhost:8000/deliveries/msg-2026-10-04-0001
 ```
 app/
   config.py    # 环境变量配置
-  db.py        # SQLite 连接、建表、BEGIN IMMEDIATE 事务、只读快照事务
+  db.py        # SQLite 连接、建表（含草稿修订快照表与旧库迁移）、BEGIN IMMEDIATE 事务、只读快照事务
   routing.py   # 地址校验、规则集、逐跳解析、发布前全量校验
   traffic.py   # 默认投递的稳定分桶：规范化地址 → 0–99 桶 → 基线/候选
   preview.py   # 发布前预览：草稿 vs 基线版本的投递差异对比（纯内存，不落库）
-  models.py    # 请求模型与编辑期校验（无效地址/重复规则/空目标）
-  store.py     # 草稿、发布版本、默认投递策略与幂等投递判定的持久化、修订号核对
-  main.py      # FastAPI 路由（/resolve、/preview、/policy、/deliver、/deliveries 等）
-tests/         # pytest：API 全流程 + 解析单元测试 + 发布前预览 + 灰度策略 + 幂等投递判定
+  models.py    # 请求模型与编辑期校验（无效地址/重复规则/空目标/重复操作键）
+  store.py     # 草稿、草稿修订快照、发布版本、默认投递策略与幂等投递判定的持久化、修订号与键级核对
+  main.py      # FastAPI 路由（/draft、/publish、/resolve、/preview、/policy、/deliver、/deliveries 等）
+tests/         # pytest：API 全流程 + 解析单元测试 + 按键合并 + 发布前预览 + 灰度策略 + 幂等投递判定
 Dockerfile / docker-compose.yml
 ```

@@ -1,4 +1,4 @@
-"""HTTP API：草稿编辑（乐观锁）、发布（原子校验 + 不可变版本）、按版本解析、发布前预览、默认投递策略、幂等投递判定。"""
+"""HTTP API：草稿编辑（整体替换 / 按键合并，乐观锁）、发布（原子校验 + 不可变版本）、按版本解析、发布前预览、默认投递策略、幂等投递判定。"""
 from __future__ import annotations
 
 import sqlite3
@@ -10,12 +10,14 @@ from . import db, preview, store
 from .models import (
     DeliverRequest,
     DeliverySubmit,
+    DraftOpsUpdate,
     DraftUpdate,
     PolicyUpdate,
     PreviewRequest,
     PublishRequest,
     ResolveRequest,
     ValidationFailure,
+    normalize_ops,
     normalize_rules,
 )
 from .routing import ResolutionError, RuleSet, is_valid_address, resolve, validate_ruleset
@@ -65,6 +67,64 @@ def put_draft(body: DraftUpdate) -> dict:
     except sqlite3.OperationalError as exc:  # 并发写冲突
         raise HTTPException(status_code=409, detail={"error": "write_conflict", "message": str(exc)})
     return {"revision": new_revision, "rules": [store.rule_to_dict(r) for r in rules]}
+
+
+@app.patch("/draft")
+def patch_draft(body: DraftOpsUpdate) -> dict:
+    """多人协作的按键合并：提交一组 set/delete 操作与所见草稿修订号。
+
+    所见修订即当前修订时直接合并；落后时取出所见修订的草稿快照，仅当本次
+    操作涉及的每个键相对该快照均未改变，才把整组操作合并到当前草稿
+    （新修订 +1，并留下新修订快照）；任一键已改变返回 409（附冲突键与当前
+    修订号），草稿不变；无法取得所见修订快照时明确拒绝（409）。
+    重复操作键、删除当前不存在的规则、无效规则整组拒绝（422），草稿不变。
+    核对与写入在单个 BEGIN IMMEDIATE 事务内原子完成。
+    """
+    try:
+        set_rules, delete_keys = normalize_ops(body.ops)
+    except ValidationFailure as exc:
+        raise HTTPException(status_code=422, detail={"error": "invalid_ops", "message": str(exc)})
+    try:
+        with db.transaction() as conn:
+            new_revision, merged = store.apply_draft_ops(conn, body.revision, set_rules, delete_keys)
+    except store.KeysConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "keys_conflict",
+                "current_revision": exc.current,
+                "conflicting_keys": [
+                    {"match_type": match_type, "match_key": match_key}
+                    for match_type, match_key in exc.conflicting_keys
+                ],
+                "message": str(exc),
+            },
+        )
+    except store.SnapshotUnavailable as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "snapshot_unavailable",
+                "current_revision": exc.current,
+                "seen_revision": exc.seen,
+                "message": str(exc),
+            },
+        )
+    except store.DeleteMissingRule as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "delete_missing",
+                "missing_keys": [
+                    {"match_type": match_type, "match_key": match_key}
+                    for match_type, match_key in exc.missing_keys
+                ],
+                "message": str(exc),
+            },
+        )
+    except sqlite3.OperationalError as exc:  # 并发写冲突
+        raise HTTPException(status_code=409, detail={"error": "write_conflict", "message": str(exc)})
+    return {"revision": new_revision, "rules": [store.rule_to_dict(r) for r in merged]}
 
 
 @app.post("/publish")
