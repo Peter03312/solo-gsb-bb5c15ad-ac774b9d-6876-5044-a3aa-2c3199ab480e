@@ -12,6 +12,17 @@
   任一分支**拒收 / 无路由 / 成环** → 整次解析失败（422），不返回部分结果。
 - **草稿编辑**：整体替换，必须携带所见修订号（乐观锁），冲突返回 409。
   无效地址、重复规则、空目标（`route` 无目标 / `reject` 带目标）在编辑期即拒绝（422）。
+- **多人协作的按键合并**：`POST /draft/changes` 按规则键提交一组 `upsert`（设置）/ `delete`（删除）
+  操作并携带所见草稿修订号；键与内容沿用整体替换的同一套规范化与编辑期校验。
+  所见修订落后时，**仅当本次操作涉及的每个键相对所见快照在当前草稿中均未改变**
+  （存在性与完整内容一致）才把整组操作合并并产生一个新修订；否则返回 `409`，附**全部冲突键**与
+  当前修订号，草稿不变。重复操作键、删除当前不存在的规则、无效规则一律**整组拒绝（422）**；
+  **无法取得所见修订的快照时明确拒绝合并**（409 `revision_snapshot_unavailable`）。
+  核对与写入在单个 `BEGIN IMMEDIATE` 事务内原子完成。
+- **草稿修订快照**：每次草稿变更（整体替换与按键合并）都留存一份完整规则快照，
+  初始空草稿为修订 `0`；`GET /draft/revisions` 与 `GET /draft/revisions/{n}` 可逐一核对。
+  旧版本程序生成的数据库没有历史快照，升级后不会臆造：只有升级后新发生的变更（及当前修订上的操作）
+  可合并，引用缺失快照的旧所见修订号会被明确拒绝。
 - **发布**：在单个事务（`BEGIN IMMEDIATE`）内原子核对修订号，并校验**所有规则目标可解析且无环**；
   成功则生成不可变版本，失败则保持旧版本不变。
 - **历史版本**：所有发布版本永久可查，按任意历史版本解析可复现当时的结果。
@@ -73,6 +84,9 @@ pytest tests/ -q                                   # 运行测试
 | GET  | `/health`         | 健康检查                               |
 | GET  | `/draft`          | 查看草稿（含当前修订号）               |
 | PUT  | `/draft`          | 整体替换草稿，需携带所见修订号         |
+| POST | `/draft/changes`  | 多人协作：按规则键合并一组 upsert/delete，需所见修订号 |
+| GET  | `/draft/revisions` | 列出全部草稿修订（每次变更的快照）   |
+| GET  | `/draft/revisions/{n}` | 查看某个草稿修订的完整规则快照     |
 | POST | `/publish`        | 核对修订号 + 全量校验后发布不可变版本  |
 | GET  | `/versions`       | 列出全部已发布版本                     |
 | GET  | `/versions/{n}`   | 查看某个历史版本的完整规则             |
@@ -113,6 +127,76 @@ curl -X PUT http://localhost:8000/draft -H 'Content-Type: application/json' -d '
 ```
 
 修订号过期时返回 `409`：`{"detail": {"error": "revision_conflict", "current_revision": 1, ...}}`。
+
+### 1.1 多人协作：按规则键合并（POST /draft/changes）
+
+多个维护者各自只改动自己负责的规则键时，不必整体回传整份草稿。提交一组操作，每个操作一个规则键：
+
+- `{"op": "upsert", "match_type": ..., "match_key": ..., "action": ..., "targets": ...}`：设置一条规则
+  （不存在则新增，已存在则整条覆盖）；规则字段形状与 `/draft` 的规则完全一致。
+- `{"op": "delete", "match_type": ..., "match_key": ...}`：删除一条规则，**不可**携带 `action` / `targets`。
+
+规则键（去空白、小写；`exact` 须为合法地址、`domain` 须为合法域）与规则内容沿用上面同一套
+规范化与编辑期校验。请求同样携带**所见草稿修订号**：
+
+```bash
+curl -X POST http://localhost:8000/draft/changes -H 'Content-Type: application/json' -d '{
+  "revision": 1,
+  "changes": [
+    {"op": "upsert", "match_type": "exact", "match_key": " BOSS@CORP.EXAMPLE.COM ", "action": "route",
+     "targets": [{"kind": "alias", "value": "assistant@corp.example.com"}]},
+    {"op": "delete", "match_type": "domain", "match_key": "old-corp.example.com"}
+  ]}'
+# => {"revision": 2, "rules": [...合并后的整份草稿...]}
+```
+
+**落后修订的合并判定**（事务内原子完成）：
+
+- 若所见修订已落后，服务取出所见修订的完整快照，逐个比对本次操作涉及的键：
+  该键在**所见快照与当前草稿中的完整规则一致**（两边都不存在也算一致）才算“未改变”。
+  - 涉及键**全部未改变** → 整组操作合并进当前草稿，产生一个新修订（与他人不相交的改动互不阻塞）；
+  - 任一涉及键已被他人改动（内容变化、被删除或被新增）→ `409`，返回**全部冲突键**与当前修订号，
+    草稿保持不变，整组操作不落任何一项：
+
+    ```json
+    {"detail": {"error": "revision_conflict", "current_revision": 2,
+                "conflict_keys": [{"match_type": "exact", "match_key": "boss@corp.example.com"}],
+                "message": "revision conflict: 1 involved key(s) changed since the seen revision"}}
+    ```
+
+  拿到冲突后，调用方重新 `GET /draft` 拉取当前修订号，解决冲突后带新修订号重试即可。
+
+**整组拒绝（422，不消耗修订号、草稿不变）**：
+
+- 重复操作键（规范化后相同，即使一个 upsert 一个 delete）→
+  `{"error": "duplicate_change_key", ...}`；
+- 删除当前草稿中不存在的规则 → `{"error": "rule_not_found", "match_type": ..., "match_key": ...}`；
+- 无效规则（非法地址 / 域、`route` 无目标、`reject` 带目标、非法目标地址等）→
+  `{"error": "invalid_rule", ...}`；`changes` 为空同样 422。
+
+**快照缺失**：所见修订号既不是当前修订、又取不到它的修订快照（如旧版程序遗留的数据库未留存该修订）
+→ `409 {"error": "revision_snapshot_unavailable", "revision": ..., "current_revision": ...}`，
+绝不按当前状态盲合并。
+
+并发提交在单个 `BEGIN IMMEDIATE` 事务内完成“核对 + 写入”：不相交键的两组操作串行化后各自成功，
+相交键的后到者得到冲突；任何失败都整体回滚。合并后的草稿与整体替换后的草稿完全等价，
+照旧走 `/publish` 发布，再用 `/resolve`、`/deliver` 等接口解析。
+
+### 1.2 草稿修订快照（GET /draft/revisions）
+
+每次草稿变更（`PUT /draft` 或 `POST /draft/changes`）都产生一个修订号并留存完整规则快照，
+初始空草稿为修订 `0`：
+
+```bash
+curl http://localhost:8000/draft/revisions
+# => {"revisions": [{"revision": 0, "rule_count": 0, "created_at": "..."},
+#                   {"revision": 1, "rule_count": 5, "created_at": "..."}, ...]}
+
+curl http://localhost:8000/draft/revisions/1
+# => {"revision": 1, "rules": [...该修订的完整规则...]}
+```
+
+未知修订号返回 `404 {"error": "draft_revision_not_found", "revision": n}`。
 
 ### 2. 发布（原子核对修订号 + 校验目标可解析、无环）
 
@@ -408,9 +492,9 @@ app/
   routing.py   # 地址校验、规则集、逐跳解析、发布前全量校验
   traffic.py   # 默认投递的稳定分桶：规范化地址 → 0–99 桶 → 基线/候选
   preview.py   # 发布前预览：草稿 vs 基线版本的投递差异对比（纯内存，不落库）
-  models.py    # 请求模型与编辑期校验（无效地址/重复规则/空目标）
-  store.py     # 草稿、发布版本、默认投递策略与幂等投递判定的持久化、修订号核对
-  main.py      # FastAPI 路由（/resolve、/preview、/policy、/deliver、/deliveries 等）
-tests/         # pytest：API 全流程 + 解析单元测试 + 发布前预览 + 灰度策略 + 幂等投递判定
+  models.py    # 请求模型与编辑期校验（无效地址/重复规则/空目标/按键合并操作组）
+  store.py     # 草稿、修订快照、发布版本、默认投递策略与幂等投递判定的持久化、修订号核对与按键合并
+  main.py      # FastAPI 路由（/draft、/draft/changes、/resolve、/preview、/policy、/deliver、/deliveries 等）
+tests/         # pytest：API 全流程 + 解析单元测试 + 发布前预览 + 灰度策略 + 幂等投递判定 + 按键合并与修订快照
 Dockerfile / docker-compose.yml
 ```

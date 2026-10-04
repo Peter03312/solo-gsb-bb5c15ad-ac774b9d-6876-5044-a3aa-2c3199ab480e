@@ -10,12 +10,14 @@ from . import db, preview, store
 from .models import (
     DeliverRequest,
     DeliverySubmit,
+    DraftChangesRequest,
     DraftUpdate,
     PolicyUpdate,
     PreviewRequest,
     PublishRequest,
     ResolveRequest,
     ValidationFailure,
+    normalize_changes,
     normalize_rules,
 )
 from .routing import ResolutionError, RuleSet, is_valid_address, resolve, validate_ruleset
@@ -65,6 +67,82 @@ def put_draft(body: DraftUpdate) -> dict:
     except sqlite3.OperationalError as exc:  # 并发写冲突
         raise HTTPException(status_code=409, detail={"error": "write_conflict", "message": str(exc)})
     return {"revision": new_revision, "rules": [store.rule_to_dict(r) for r in rules]}
+
+
+@app.post("/draft/changes")
+def patch_draft(body: DraftChangesRequest) -> dict:
+    """多人协作：按规则键合并一组设置（upsert）/ 删除（delete）操作。
+
+    规则键与内容沿用现有规范化与编辑期校验；重复操作键、删除当前不存在的规则、
+    无效规则一律整组拒绝（422），草稿不变。
+    所见修订落后时，仅当本次操作涉及的每个键相对所见快照在当前草稿中均未改变，
+    才把整组操作合并并产生一个新修订；否则 409 返回全部冲突键与当前修订号，草稿不变。
+    无法取得所见修订的快照时明确拒绝合并（409）。
+    核对与写入在单个 BEGIN IMMEDIATE 事务内原子完成。
+    """
+    try:
+        changes = normalize_changes(body.changes)
+    except ValidationFailure as exc:
+        raise HTTPException(status_code=422, detail={"error": exc.code, "message": str(exc)})
+    try:
+        with db.transaction() as conn:
+            new_revision, rules = store.merge_draft(conn, body.revision, changes)
+    except store.MergeConflict as exc:  # 必须先于父类 RevisionConflict 捕获
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "revision_conflict",
+                "current_revision": exc.current,
+                "conflict_keys": exc.conflict_keys,
+                "message": f"revision conflict: {len(exc.conflict_keys)} involved key(s) changed since the seen revision",
+            },
+        )
+    except store.RevisionConflict as exc:
+        raise _conflict(exc)
+    except store.RevisionSnapshotUnavailable as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "revision_snapshot_unavailable",
+                "revision": exc.revision,
+                "current_revision": exc.current,
+                "message": f"snapshot for seen revision {exc.revision} is unavailable; merge refused",
+            },
+        )
+    except store.DraftRuleNotFound as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "rule_not_found",
+                "match_type": exc.match_type,
+                "match_key": exc.match_key,
+                "message": str(exc),
+            },
+        )
+    except sqlite3.OperationalError as exc:  # 并发写冲突
+        raise HTTPException(status_code=409, detail={"error": "write_conflict", "message": str(exc)})
+    return {"revision": new_revision, "rules": [store.rule_to_dict(r) for r in rules]}
+
+
+@app.get("/draft/revisions")
+def list_draft_revisions() -> dict:
+    """列出全部草稿修订（含整体替换与按键合并；revision 0 为初始空草稿）。"""
+    with db.connect() as conn:
+        return {"revisions": store.list_draft_revisions(conn)}
+
+
+@app.get("/draft/revisions/{revision}")
+def get_draft_revision(revision: int) -> dict:
+    """查看某个草稿修订的完整规则快照（可核对每次草稿变更）。"""
+    with db.connect() as conn:
+        found = store.get_draft_at(conn, revision)
+    if found is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "draft_revision_not_found", "revision": revision},
+        )
+    rev, rules = found
+    return {"revision": rev, "rules": [store.rule_to_dict(r) for r in rules]}
 
 
 @app.post("/publish")

@@ -22,6 +22,9 @@ def client():
         "DELETE FROM version_rules;"
         "DELETE FROM versions;"
         "DELETE FROM sqlite_sequence WHERE name = 'versions';"
+        "DELETE FROM draft_revisions;"
+        "INSERT INTO draft_revisions (revision, rules, rule_count, created_at)"
+        " VALUES (0, '[]', 0, strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now'));"
         "UPDATE draft_meta SET revision = 0 WHERE id = 1;"
     )
     conn.close()

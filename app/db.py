@@ -1,4 +1,4 @@
-"""SQLite 存储层：草稿（带乐观锁修订号）与不可变发布版本。"""
+"""SQLite 存储层：草稿（修订号 + 修订快照）、不可变发布版本、默认投递策略与幂等投递判定。"""
 from __future__ import annotations
 
 import os
@@ -20,6 +20,17 @@ CREATE TABLE IF NOT EXISTS draft_rules (
     action     TEXT NOT NULL CHECK (action IN ('reject', 'route')),
     targets    TEXT NOT NULL DEFAULT '[]',   -- JSON: [{"kind": "alias"|"mailbox", "value": "..."}]
     PRIMARY KEY (match_type, match_key)
+);
+
+-- 草稿修订快照：每次草稿变更（整体替换 PUT /draft 或按键合并 POST /draft/changes）
+-- 都留存一份完整规则快照，供多人合并时核对“所见修订”与事后审计。
+-- revision 0（初始空草稿）由 init_db 在全新库上补写；旧库升级不臆造历史快照——
+-- 合并时若取不到所见修订的快照则明确拒绝。
+CREATE TABLE IF NOT EXISTS draft_revisions (
+    revision   INTEGER PRIMARY KEY,              -- 草稿修订号，与 draft_meta.revision 对应
+    rules      TEXT NOT NULL,                    -- JSON 完整规则快照（形状与 /draft 的 rules 一致）
+    rule_count INTEGER NOT NULL,
+    created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS versions (
@@ -81,6 +92,16 @@ def init_db() -> None:
     conn = connect()
     try:
         conn.executescript(SCHEMA)
+        # 仅在全新库（当前确为空草稿 rev0）补写初始快照；旧库升级不臆造历史快照。
+        missing = conn.execute(
+            "SELECT 1 FROM draft_meta WHERE id = 1 AND revision = 0 "
+            "AND NOT EXISTS (SELECT 1 FROM draft_revisions WHERE revision = 0)"
+        ).fetchone()
+        if missing is not None:
+            conn.execute(
+                "INSERT INTO draft_revisions (revision, rules, rule_count, created_at) "
+                "VALUES (0, '[]', 0, strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now'))"
+            )
     finally:
         conn.close()
 

@@ -1,4 +1,4 @@
-"""持久层：草稿（带乐观锁修订号）、不可变发布版本、默认投递策略（基线/候选灰度）与幂等投递判定。"""
+"""持久层：草稿（带乐观锁修订号、按键合并与修订快照）、不可变发布版本、默认投递策略（基线/候选灰度）与幂等投递判定。"""
 from __future__ import annotations
 
 import json
@@ -14,6 +14,32 @@ class RevisionConflict(Exception):
     def __init__(self, current: int, subject: str = "draft"):
         super().__init__(f"revision conflict: current {subject} revision is {current}")
         self.current = current
+
+
+class RevisionSnapshotUnavailable(Exception):
+    """无法取得客户端所见修订的快照（如旧库未留存该修订）：明确拒绝合并。"""
+
+    def __init__(self, revision: int, current: int):
+        super().__init__(f"revision snapshot unavailable: {revision} (current revision is {current})")
+        self.revision = revision
+        self.current = current
+
+
+class MergeConflict(RevisionConflict):
+    """落后修订合并时，本次操作涉及的键中有相对所见快照已改变的键。"""
+
+    def __init__(self, current: int, conflict_keys: list[dict]):
+        super().__init__(current)
+        self.conflict_keys = conflict_keys
+
+
+class DraftRuleNotFound(Exception):
+    """删除操作引用了当前草稿中不存在的规则。"""
+
+    def __init__(self, match_type: str, match_key: str):
+        super().__init__(f"rule not found in draft: {match_type} {match_key}")
+        self.match_type = match_type
+        self.match_key = match_key
 
 
 class PolicyVersionNotFound(Exception):
@@ -34,6 +60,15 @@ def _row_to_rule(row: sqlite3.Row) -> Rule:
     )
 
 
+def _rule_from_doc(doc: dict) -> Rule:
+    return Rule(
+        match_type=doc["match_type"],
+        match_key=doc["match_key"],
+        action=doc["action"],
+        targets=tuple(Target(kind=t["kind"], value=t["value"]) for t in doc.get("targets", [])),
+    )
+
+
 def rule_to_dict(rule: Rule) -> dict:
     return {
         "match_type": rule.match_type,
@@ -41,6 +76,15 @@ def rule_to_dict(rule: Rule) -> dict:
         "action": rule.action,
         "targets": [{"kind": t.kind, "value": t.value} for t in rule.targets],
     }
+
+
+def _save_draft_snapshot(conn: sqlite3.Connection, revision: int, rules: list[Rule]) -> None:
+    """把某次草稿变更的完整规则快照写入 draft_revisions。须在事务内调用。"""
+    created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    conn.execute(
+        "INSERT INTO draft_revisions (revision, rules, rule_count, created_at) VALUES (?, ?, ?, ?)",
+        (revision, json.dumps([rule_to_dict(r) for r in rules]), len(rules), created_at),
+    )
 
 
 def get_draft(conn: sqlite3.Connection) -> tuple[int, list[Rule]]:
@@ -52,7 +96,10 @@ def get_draft(conn: sqlite3.Connection) -> tuple[int, list[Rule]]:
 
 
 def replace_draft(conn: sqlite3.Connection, expected_revision: int, rules: list[Rule]) -> int:
-    """整体替换草稿；修订号不匹配抛 RevisionConflict。须在事务内调用。"""
+    """整体替换草稿；修订号不匹配抛 RevisionConflict。须在事务内调用。
+
+    成功后留存完整修订快照（与按键合并一样可核对）。
+    """
     revision, _ = get_draft(conn)
     if revision != expected_revision:
         raise RevisionConflict(revision)
@@ -71,7 +118,96 @@ def replace_draft(conn: sqlite3.Connection, expected_revision: int, rules: list[
     )
     new_revision = revision + 1
     conn.execute("UPDATE draft_meta SET revision = ? WHERE id = 1", (new_revision,))
+    _save_draft_snapshot(conn, new_revision, rules)
     return new_revision
+
+
+def _rules_by_key(rules: list[Rule]) -> dict[tuple[str, str], Rule]:
+    return {(r.match_type, r.match_key): r for r in rules}
+
+
+def get_draft_at(conn: sqlite3.Connection, revision: int) -> tuple[int, list[Rule]] | None:
+    """读取某个历史草稿修订的完整快照；不存在返回 None。"""
+    row = conn.execute(
+        "SELECT revision, rules FROM draft_revisions WHERE revision = ?", (revision,)
+    ).fetchone()
+    if row is None:
+        return None
+    return row["revision"], [_rule_from_doc(doc) for doc in json.loads(row["rules"])]
+
+
+def list_draft_revisions(conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute(
+        "SELECT revision, rule_count, created_at FROM draft_revisions ORDER BY revision"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def merge_draft(
+    conn: sqlite3.Connection,
+    expected_revision: int,
+    changes: list[tuple[str, str, str, Rule | None]],
+) -> tuple[int, list[Rule]]:
+    """把一组按键设置 / 删除操作合并进当前草稿。须在写事务内调用。
+
+    - 取得到所见修订（expected_revision）的快照后逐键核对：仅当本次涉及的每个键
+      相对该快照在当前草稿中均未改变（存在性与完整内容一致）时才合并；
+      否则抛 MergeConflict（附全部冲突键与当前修订号），草稿不变。
+    - 所见修订即当前修订时，键必然“未改变”，直接合并。
+    - 无法取得所见修订快照（RevisionSnapshotUnavailable）时明确拒绝合并。
+    - 删除当前草稿中不存在的规则抛 DraftRuleNotFound（整组拒绝，草稿不变）。
+    成功则写入合并结果、修订号 +1，并留存完整修订快照。
+    """
+    revision, current_rules = get_draft(conn)
+    current_by_key = _rules_by_key(current_rules)
+
+    if revision != expected_revision:
+        seen = get_draft_at(conn, expected_revision)
+        if seen is None:
+            raise RevisionSnapshotUnavailable(expected_revision, revision)
+        seen_by_key = _rules_by_key(seen[1])
+        conflict_keys: list[dict] = []
+        for _op, match_type, key, _rule in changes:
+            ident = (match_type, key)
+            seen_rule = seen_by_key.get(ident)
+            current_rule = current_by_key.get(ident)
+            if seen_rule != current_rule:  # 含“快照存在 / 当前不存在”与反向新增
+                conflict_keys.append({"match_type": match_type, "match_key": key})
+        if conflict_keys:
+            raise MergeConflict(revision, conflict_keys)
+
+    # 键相对所见快照均未改变（或所见即当前）：删除前先确认规则当前存在
+    for _op, match_type, key, _rule in changes:
+        if _op == "delete" and (match_type, key) not in current_by_key:
+            raise DraftRuleNotFound(match_type, key)
+
+    merged = dict(current_by_key)
+    for op, match_type, key, rule in changes:
+        ident = (match_type, key)
+        if op == "delete":
+            del merged[ident]
+        else:
+            assert rule is not None
+            merged[ident] = rule
+    new_rules = sorted(merged.values(), key=lambda r: (r.match_type, r.match_key))
+
+    conn.execute("DELETE FROM draft_rules")
+    conn.executemany(
+        "INSERT INTO draft_rules (match_type, match_key, action, targets) VALUES (?, ?, ?, ?)",
+        [
+            (
+                r.match_type,
+                r.match_key,
+                r.action,
+                json.dumps([{"kind": t.kind, "value": t.value} for t in r.targets]),
+            )
+            for r in new_rules
+        ],
+    )
+    new_revision = revision + 1
+    conn.execute("UPDATE draft_meta SET revision = ? WHERE id = 1", (new_revision,))
+    _save_draft_snapshot(conn, new_revision, new_rules)
+    return new_revision, new_rules
 
 
 def publish(conn: sqlite3.Connection, expected_revision: int, rules: list[Rule]) -> int:
